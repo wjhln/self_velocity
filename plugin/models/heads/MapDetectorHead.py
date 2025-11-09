@@ -13,6 +13,7 @@ from mmdet.models import HEADS
 from mmdet.models.utils.transformer import inverse_sigmoid
 from ..utils.memory_buffer import StreamTensorMemory
 from ..utils.query_update import MotionMLP
+from ..utils.velocity_motion_mlp import VelocityMotionMLP
 
 @HEADS.register_module(force=True)
 class MapDetectorHead(nn.Module):
@@ -59,15 +60,30 @@ class MapDetectorHead(nn.Module):
             self.batch_size = streaming_cfg['batch_size']
             self.topk_query = streaming_cfg['topk']
             self.trans_loss_weight = streaming_cfg.get('trans_loss_weight', 0.0)
+            self.use_velocity_prior = streaming_cfg.get('use_velocity_prior', False)
+            
             self.query_memory = StreamTensorMemory(
                 self.batch_size,
             )
             self.reference_points_memory = StreamTensorMemory(
                 self.batch_size,
             )
-            c_dim = 12
-
-            self.query_update = MotionMLP(c_dim=c_dim, f_dim=self.embed_dims, identity=True)
+            
+            # 选择query更新模块
+            if self.use_velocity_prior:
+                pose_dim = 12  # 3x3旋转 + 3平移
+                velocity_dim = 4  # vx, vy, |v|, dt
+                self.query_update = VelocityMotionMLP(
+                    pose_dim=pose_dim,
+                    velocity_dim=velocity_dim,
+                    f_dim=self.embed_dims,
+                    use_velocity=True,
+                    identity=True
+                )
+            else:
+                c_dim = 12
+                self.query_update = MotionMLP(c_dim=c_dim, f_dim=self.embed_dims, identity=True)
+            
             self.target_memory = StreamTensorMemory(self.batch_size)
             
         self.register_buffer('roi_size', torch.tensor(roi_size, dtype=torch.float32))
@@ -235,10 +251,34 @@ class MapDetectorHead(nn.Module):
                 pos_encoding = prev2curr_matrix.float()[:3].view(-1)
 
                 prop_q = query_memory[i]
-                query_memory_updated = self.query_update(
-                    prop_q, # (topk, embed_dims)
-                    pos_encoding.view(1, -1).repeat(len(query_memory[i]), 1)
-                )
+                
+                # 构建速度编码
+                if self.use_velocity_prior and 'velocity' in img_metas[i]:
+                    velocity = img_metas[i]['velocity']  # [vx, vy, vz]
+                    velocity_magnitude = img_metas[i].get('velocity_magnitude', 0.0)
+                    
+                    # 计算时间差
+                    if 'timestamp' in pose_memory[i] and 'timestamp' in img_metas[i]:
+                        dt = (img_metas[i]['timestamp'] - pose_memory[i]['timestamp']) / 1e6
+                    else:
+                        dt = 0.5  # 默认0.5秒
+                    
+                    # 速度编码: [vx, vy, |v|, dt]
+                    velocity_encoding = query_embedding.new_tensor([
+                        velocity[0], velocity[1], velocity_magnitude, dt
+                    ]).float().view(1, -1)
+                    
+                    query_memory_updated = self.query_update(
+                        prop_q,  # (topk, embed_dims)
+                        pos_encoding.view(1, -1),  # (1, 12)
+                        velocity_encoding  # (1, 4)
+                    )
+                else:
+                    query_memory_updated = self.query_update(
+                        prop_q,  # (topk, embed_dims)
+                        pos_encoding.view(1, -1).repeat(len(query_memory[i]), 1)
+                    )
+                
                 propagated_query_list.append(query_memory_updated.clone())
 
                 pred = self.reg_branches[-1](query_memory_updated).sigmoid() # (num_prop, 2*num_pts)
