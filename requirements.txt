@@ -1,2 +1,1 @@
-av2
 nuscenes-devkit

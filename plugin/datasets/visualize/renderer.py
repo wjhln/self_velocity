@@ -1,9 +1,7 @@
 import os.path as osp
 import os
-import av2.geometry.interpolate as interp_utils
 import numpy as np
 import copy
-import cv2
 import matplotlib.pyplot as plt
 from PIL import Image
 
