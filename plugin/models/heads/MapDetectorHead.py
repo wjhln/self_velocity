@@ -14,6 +14,7 @@ from mmdet.models.utils.transformer import inverse_sigmoid
 from ..utils.memory_buffer import StreamTensorMemory
 from ..utils.query_update import MotionMLP
 from ..utils.velocity_motion_mlp import VelocityMotionMLP
+from ..utils.point_matcher import PointMatcher
 
 @HEADS.register_module(force=True)
 class MapDetectorHead(nn.Module):
@@ -61,6 +62,8 @@ class MapDetectorHead(nn.Module):
             self.topk_query = streaming_cfg['topk']
             self.trans_loss_weight = streaming_cfg.get('trans_loss_weight', 0.0)
             self.use_velocity_prior = streaming_cfg.get('use_velocity_prior', False)
+            self.use_point_matching_prior = streaming_cfg.get('use_point_matching_prior', False)
+            self.matching_loss_weight = streaming_cfg.get('matching_loss_weight', 0.5)
             
             self.query_memory = StreamTensorMemory(
                 self.batch_size,
@@ -83,6 +86,14 @@ class MapDetectorHead(nn.Module):
             else:
                 c_dim = 12
                 self.query_update = MotionMLP(c_dim=c_dim, f_dim=self.embed_dims, identity=True)
+            
+            # 🆕 点匹配模块
+            if self.use_point_matching_prior:
+                self.point_matcher = PointMatcher(
+                    num_points=self.num_points,
+                    distance_threshold=2.0,  # 2米阈值
+                    confidence_sigma=1.0
+                )
             
             self.target_memory = StreamTensorMemory(self.batch_size)
             
@@ -206,7 +217,7 @@ class MapDetectorHead(nn.Module):
         assert list(bev_features.shape) == [B, self.embed_dims, H, W]
         return bev_features
 
-    def propagate(self, query_embedding, img_metas, return_loss=True):
+    def propagate(self, query_embedding, img_metas, gts=None, return_loss=True):
         bs = query_embedding.shape[0]
         propagated_query_list = []
         prop_reference_points_list = []
@@ -220,6 +231,7 @@ class MapDetectorHead(nn.Module):
         if return_loss:
             target_memory = self.target_memory.get(img_metas)['tensor']
             trans_loss = query_embedding.new_zeros((1,))
+            matching_loss = query_embedding.new_zeros((1,))  # 🆕 点匹配loss
             num_pos = 0
 
         is_first_frame_list = tmp['is_first_frame']
@@ -319,6 +331,37 @@ class MapDetectorHead(nn.Module):
                 curr_ref_pts = torch.einsum('lk,ijk->ijl', prev2curr_matrix, denormed_ref_pts.double()).float()
                 normed_ref_pts = (curr_ref_pts[..., :2] - self.origin) / self.roi_size # (num_prop, num_pts, 2)
                 normed_ref_pts = torch.clip(normed_ref_pts, min=0., max=1.)
+                
+                # 🆕 点匹配先验
+                if return_loss and gts is not None and self.use_point_matching_prior:
+                    # 获取当前帧的GT线
+                    gt_lines = gts['lines'][i]  # (num_gt, 2*num_points) 或 (num_gt, num_points, 2)
+                    
+                    # 确保GT格式正确
+                    if gt_lines.dim() == 2:
+                        gt_lines = gt_lines.view(-1, self.num_points, 2)  # (num_gt, num_points, 2)
+                    
+                    # 点匹配
+                    matched_gt_points, confidence, _ = self.point_matcher(
+                        normed_ref_pts,  # (topk, num_points, 2)
+                        gt_lines         # (num_gt, num_points, 2)
+                    )
+                    
+                    # 计算匹配loss（只对有效匹配计算）
+                    valid_match_mask = (confidence > 0.1).squeeze(-1)  # (topk,)
+                    if valid_match_mask.sum() > 0:
+                        match_weights = weights.clone()
+                        match_weights[~valid_match_mask] = 0.0
+                        
+                        matching_loss += self.loss_reg(
+                            normed_ref_pts.view(-1, 2*self.num_points),
+                            matched_gt_points.view(-1, 2*self.num_points),
+                            match_weights,
+                            avg_factor=1.0
+                        )
+                    
+                    # 可选：融合几何变换和匹配先验
+                    # normed_ref_pts = confidence * matched_gt_points + (1 - confidence) * normed_ref_pts
 
                 prop_reference_points_list.append(normed_ref_pts)
                 
@@ -333,7 +376,16 @@ class MapDetectorHead(nn.Module):
 
         if return_loss:
             trans_loss = self.trans_loss_weight * trans_loss / (num_pos + 1e-10)
-            return query_embedding, prop_query_embedding, init_reference_points, prop_ref_pts, memory_query_embedding, is_first_frame_list, trans_loss
+            
+            # 🆕 加入点匹配loss
+            if self.use_point_matching_prior:
+                matching_loss = self.matching_loss_weight * matching_loss / (num_pos + 1e-10)
+                total_trans_loss = trans_loss + matching_loss
+            else:
+                matching_loss = query_embedding.new_zeros((1,))
+                total_trans_loss = trans_loss
+            
+            return query_embedding, prop_query_embedding, init_reference_points, prop_ref_pts, memory_query_embedding, is_first_frame_list, total_trans_loss, matching_loss
         else:
             return query_embedding, prop_query_embedding, init_reference_points, prop_ref_pts, memory_query_embedding, is_first_frame_list
 
@@ -362,8 +414,8 @@ class MapDetectorHead(nn.Module):
         input_query_num = self.num_queries
         # num query: self.num_query + self.topk
         if self.streaming_query:
-            query_embedding, prop_query_embedding, init_reference_points, prop_ref_pts, memory_query, is_first_frame_list, trans_loss = \
-                self.propagate(query_embedding, img_metas, return_loss=True)
+            query_embedding, prop_query_embedding, init_reference_points, prop_ref_pts, memory_query, is_first_frame_list, trans_loss, matching_loss = \
+                self.propagate(query_embedding, img_metas, gts=gts, return_loss=True)  # 🆕 传入gts
             
         else:
             init_reference_points = self.reference_points_embed(query_embedding).sigmoid() # (bs, num_q, 2*num_pts)
@@ -371,6 +423,8 @@ class MapDetectorHead(nn.Module):
             prop_query_embedding = None
             prop_ref_pts = None
             is_first_frame_list = [True for i in range(bs)]
+            trans_loss = None
+            matching_loss = None
         
         assert list(init_reference_points.shape) == [bs, self.num_queries, self.num_points, 2]
         assert list(query_embedding.shape) == [bs, self.num_queries, self.embed_dims]
@@ -444,6 +498,8 @@ class MapDetectorHead(nn.Module):
             self.target_memory.update(gt_targets_list, img_metas)
 
             loss_dict['trans_loss'] = trans_loss
+            if self.use_point_matching_prior:
+                loss_dict['matching_loss'] = matching_loss
 
         return outputs, loss_dict, det_match_idxs, det_match_gt_idxs
     
